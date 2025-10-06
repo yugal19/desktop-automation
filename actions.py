@@ -52,7 +52,7 @@ def _focus_window_by_title_contains(part: str, wait: float = 0.15) -> bool:
     return False
 
 
-def write_in_notepad(text: str) -> str:
+def write_in_notepad(text: str, newline: bool = False) -> str:
     if not text:
         return "⚠️ Nothing to write."
 
@@ -63,7 +63,13 @@ def write_in_notepad(text: str) -> str:
     _focus_window_by_title_contains("notepad", wait=0.15)
 
     try:
-        pyautogui.typewrite(text + "\n", interval=0.03)
+        if newline:
+            # Add Enter at the end
+            pyautogui.typewrite(text + "\n", interval=0.03)
+        else:
+            # Just type continuously, no Enter
+            pyautogui.typewrite(text + " ", interval=0.03)
+
         return "✅ Appended text to Notepad."
     except Exception as e:
         return f"❌ Error writing in Notepad: {e}"
@@ -292,8 +298,9 @@ def open_in_explorer_with_search(name: str, location: Optional[str] = None) -> s
         time.sleep(1.5)  # wait for Explorer to open
 
         # Focus Explorer window
-        if _focus_window_by_title_contains("File Explorer", wait=0.2) or \
-           _focus_window_by_title_contains("Explorer", wait=0.2):
+        if _focus_window_by_title_contains(
+            "File Explorer", wait=0.2
+        ) or _focus_window_by_title_contains("Explorer", wait=0.2):
             # Trigger search (Ctrl+F)
             pyautogui.hotkey("ctrl", "f")
             time.sleep(0.2)
@@ -315,3 +322,19 @@ def open_in_explorer_with_search(name: str, location: Optional[str] = None) -> s
 
 def search_in_explorer(name: str) -> str:
     return open_in_explorer_with_search(name, None)
+
+
+# ---------- Close File Explorer ----------
+def close_file_explorer() -> str:
+    """
+    Closes all File Explorer windows, then restarts Explorer so desktop/taskbar return.
+    """
+    try:
+        subprocess.run(
+            ["taskkill", "/f", "/im", "explorer.exe"], shell=True, check=False
+        )
+        time.sleep(1)
+        subprocess.Popen("explorer.exe", shell=True)
+        return "✅ Restarted File Explorer."
+    except Exception as e:
+        return f"❌ Error restarting File Explorer: {e}"

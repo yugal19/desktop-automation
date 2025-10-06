@@ -44,21 +44,11 @@ def _clean(text: str) -> str:
 
 import re
 
+CURRENT_APP = None
+
 
 def parse_command(text: str) -> dict:
-    """
-    Returns dict with 'intent' (one of):
-      - write (target: notepad|word, content)
-      - start_dictation / stop_dictation
-      - open (app)
-      - open_and_write (app, content)
-      - search (file/folder) -> use explorer if target=explorer
-      - search_web (query, browser?) -> google/wikipedia/youtube
-      - save (target optional)
-      - close (target)
-      - stop (stop assistant)
-      - unknown (raw)
-    """
+    global CURRENT_APP
     raw = text or ""
     t = _clean(raw)
 
@@ -88,12 +78,16 @@ def parse_command(text: str) -> dict:
             "start dictation in",
         ]
     ):
-        target = "notepad"
+        target = CURRENT_APP or "notepad"  # ✅ use last opened app
         if "word" in t:
             target = "word"
         elif "notepad" in t:
             target = "notepad"
         return {"intent": "start_dictation", "target": target}
+
+    # --- Next line command ---
+    if any(kw in t for kw in ["next line", "new line", "line break"]):
+        return {"intent": "next_line"}
 
     if any(
         kw in t
@@ -119,6 +113,8 @@ def parse_command(text: str) -> dict:
             target = "word"
         elif "notepad" in t:
             target = "notepad"
+        else:
+            target = CURRENT_APP  # ✅ fallback
         return {"intent": "save", "target": target}
 
     # --- Close commands ---
@@ -138,6 +134,8 @@ def parse_command(text: str) -> dict:
             target = "word"
         elif "notepad" in t:
             target = "notepad"
+        elif not target:
+            target = CURRENT_APP  # ✅ fallback
         return {"intent": "close", "target": target}
 
     # --- Open X and write Y ---
@@ -145,6 +143,7 @@ def parse_command(text: str) -> dict:
     if m:
         app = m.group(1).strip()
         content = m.group(2).strip()
+        CURRENT_APP = app  # ✅ remember opened app
         return {"intent": "open_and_write", "app": app, "content": content}
 
     # --- Write commands ---
@@ -153,7 +152,7 @@ def parse_command(text: str) -> dict:
             content = t[len("write ") :].strip()
         else:
             content = t[len("type ") :].strip()
-        target = "notepad"
+        target = CURRENT_APP or "notepad"  # ✅ default to last app
         if " in word" in content:
             content = content.replace(" in word", "").strip()
             target = "word"
@@ -240,13 +239,16 @@ def parse_command(text: str) -> dict:
 
     # --- Open app shortcuts ---
     for app in KNOWN_APPS:
-        if re.search(r"\b" + re.escape(app) + r"\b", t):
+        if re.search(r"(?:open|start)\s+" + re.escape(app) + r"\b", t) or re.search(
+            r"\b" + re.escape(app) + r"\b", t
+        ):
             if app == "google":
                 return {"intent": "search_web", "engine": "google", "query": ""}
+            CURRENT_APP = app  # ✅ remember app
             return {"intent": "open", "app": app}
 
-        # --- Fallback ---
-        return {"intent": "unknown", "raw": raw}
+    # --- Fallback ---
+    return {"intent": "unknown", "raw": raw}
 
     # Gemini fallback
     if ENABLE_GEMINI and genai_client:

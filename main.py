@@ -87,6 +87,20 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
             speak_feedback(msg)
             return
 
+        if intent == "next_line":
+            target = dictation_state.get("target", "notepad")
+            if target == "word":
+                # Word: press Enter
+                if actions._word_app:
+                    actions._word_app.Selection.TypeParagraph()
+            else:
+                # Notepad: press Enter
+                actions.write_in_notepad("", newline=True)
+            msg = "➡️ Moved to next line."
+            print(msg)
+            speak_feedback(msg)
+            return
+
         if intent == "save":
             target = cmd.get("target") or dictation_state.get("target")
             if target == "word":
@@ -108,6 +122,15 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
                 res = actions.close_word()
             elif target == "notepad":
                 res = actions.close_notepad()
+            elif target in ["file explorer", "explorer", "windows explorer"]:
+                try:
+                    subprocess.Popen("taskkill /im explorer.exe /f", shell=True)
+                    # Restart explorer for system stability
+                    time.sleep(1)
+                    subprocess.Popen("start explorer.exe", shell=True)
+                    res = "✅ Closed all File Explorer windows."
+                except Exception as e:
+                    res = f"❌ Could not close File Explorer: {e}"
             else:
                 exe_map = {
                     "brave": "brave.exe",
@@ -122,6 +145,7 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
                     res = f"✅ Closed {target}"
                 except Exception as e:
                     res = f"❌ Could not close {target}: {e}"
+
             print(res)
             speak_feedback(res)
             return
@@ -129,12 +153,16 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
         if intent == "write":
             target = cmd.get("target", "notepad")
             content = cmd.get("content") or raw_transcript
+            if not content.strip():
+                return
+
             if target == "word":
                 res = actions.write_in_word(content)
             else:
-                res = actions.write_in_notepad(content)
-            print(res)
-            speak_feedback(res)
+                # type continuously, no newline
+                res = actions.write_in_notepad(content, newline=False)
+
+            print(f"📝 Writing (same line): {content}")
             return
 
         # open + write compound
