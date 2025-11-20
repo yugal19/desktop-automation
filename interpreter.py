@@ -2,6 +2,7 @@
 import os
 import json
 import re
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,6 +32,7 @@ KNOWN_APPS = [
     "visual studio code",
     "youtube",
     "google",
+    "excel",
 ]
 
 
@@ -42,12 +44,20 @@ def _clean(text: str) -> str:
     return text.lower().strip()
 
 
-import re
-
 CURRENT_APP = None
 
 
 def parse_command(text: str) -> dict:
+    """
+    Parse a short desktop voice command into a structured intent dict.
+
+    Returns a dict like:
+      {"intent": "write", "target": "notepad", "content": "hello"}
+      {"intent": "open", "app": "excel"}
+      {"intent": "write_excel", "target":"excel", "content":"10", "cell":"B2"}
+      {"intent": "open_and_write_excel", "app":"excel", "content":"hello", "cell":"A1"}
+      {"intent": "unknown", "raw": "<original>"}
+    """
     global CURRENT_APP
     raw = text or ""
     t = _clean(raw)
@@ -78,12 +88,56 @@ def parse_command(text: str) -> dict:
             "start dictation in",
         ]
     ):
-        target = CURRENT_APP or "notepad"  # ✅ use last opened app
+        target = CURRENT_APP or "notepad"  # default to last opened app
         if "word" in t:
             target = "word"
         elif "notepad" in t:
             target = "notepad"
+        elif "excel" in t:
+            target = "excel"
         return {"intent": "start_dictation", "target": target}
+
+    # --- Excel: "open excel and write X" ---
+    m = re.match(r"open\s+excel\s+and\s+write\s+(.+)", t)
+    if m:
+        content_part = m.group(1).strip()
+        # Try to detect "in cell A1"
+        cell_match = re.search(r"in\s+cell\s+([a-z]+\d+)", content_part)
+        if cell_match:
+            cell = cell_match.group(1).upper()
+            content = re.sub(r"in\s+cell\s+[a-z]+\d+", "", content_part).strip()
+        else:
+            cell = None
+            content = content_part
+        CURRENT_APP = "excel"
+        return {
+            "intent": "open_and_write_excel",
+            "app": "excel",
+            "content": content,
+            "cell": cell,
+        }
+
+    # --- Explicit: "open excel" (plain) ---
+    m = re.match(r"(?:open|start)\s+(?:microsoft\s+)?excel\b", t)
+    if m:
+        CURRENT_APP = "excel"
+        return {"intent": "open", "app": "excel"}
+
+    # --- Excel: "write X in cell A1" (without open) ---
+    m = re.match(
+        r"(?:write|type|put|insert)\s+(.+?)\s+(?:in|into)\s+cell\s+([a-z]+\d+)", t
+    )
+    if m:
+        content = m.group(1).strip()
+        cell = m.group(2).upper()
+        target = "excel"
+        CURRENT_APP = "excel"
+        return {
+            "intent": "write_excel",
+            "target": target,
+            "content": content,
+            "cell": cell,
+        }
 
     # --- Next line command ---
     if any(kw in t for kw in ["next line", "new line", "line break"]):
@@ -114,7 +168,7 @@ def parse_command(text: str) -> dict:
         elif "notepad" in t:
             target = "notepad"
         else:
-            target = CURRENT_APP  # ✅ fallback
+            target = CURRENT_APP  # fallback
         return {"intent": "save", "target": target}
 
     # --- Close commands ---
@@ -135,30 +189,31 @@ def parse_command(text: str) -> dict:
         elif "notepad" in t:
             target = "notepad"
         elif not target:
-            target = CURRENT_APP  # ✅ fallback
+            target = CURRENT_APP  # fallback
         return {"intent": "close", "target": target}
 
-    # --- Open X and write Y ---
+    # --- Open X and write Y (generic, non-excel) ---
     m = re.match(r"open\s+([a-z0-9 ]+)\s+and\s+write\s+(.+)", t)
     if m:
         app = m.group(1).strip()
         content = m.group(2).strip()
-        CURRENT_APP = app  # ✅ remember opened app
+        CURRENT_APP = app
         return {"intent": "open_and_write", "app": app, "content": content}
 
-    # --- Write commands ---
+    # --- Write commands (generic) ---
     if t.startswith("write ") or t.startswith("type "):
         if t.startswith("write "):
             content = t[len("write ") :].strip()
         else:
             content = t[len("type ") :].strip()
-        target = CURRENT_APP or "notepad"  # ✅ default to last app
+        target = CURRENT_APP or "notepad"  # default to last app
         if " in word" in content:
             content = content.replace(" in word", "").strip()
             target = "word"
         if " in notepad" in content:
             content = content.replace(" in notepad", "").strip()
             target = "notepad"
+        # If user said "write X in cell B2" this will have been matched earlier and returned.
         return {"intent": "write", "target": target, "content": content}
 
     # --- Web search handling ---
@@ -237,25 +292,23 @@ def parse_command(text: str) -> dict:
             name = t[len("show ") :].strip()
         return {"intent": "search", "name": name}
 
-    # --- Open app shortcuts ---
+    # --- Open app shortcuts fallback ---
     for app in KNOWN_APPS:
+        # match "open chrome" or just "chrome"
         if re.search(r"(?:open|start)\s+" + re.escape(app) + r"\b", t) or re.search(
             r"\b" + re.escape(app) + r"\b", t
         ):
             if app == "google":
                 return {"intent": "search_web", "engine": "google", "query": ""}
-            CURRENT_APP = app  # ✅ remember app
+            CURRENT_APP = app  # remember app
             return {"intent": "open", "app": app}
 
-    # --- Fallback ---
-    return {"intent": "unknown", "raw": raw}
-
-    # Gemini fallback
+    # --- Gemini fallback (optional) ---
     if ENABLE_GEMINI and genai_client:
         try:
             prompt = f"""
 You are an assistant that converts short desktop voice commands into a JSON object with an intent.
-Allowed intents: write, start_dictation, stop_dictation, open, open_and_write, search, search_web, save, close, stop, unknown.
+Allowed intents: write, start_dictation, stop_dictation, open, open_and_write, search, search_web, save, close, stop, unknown, write_excel, open_and_write_excel.
 User: "{raw}"
 Output JSON only.
 """
@@ -269,4 +322,5 @@ Output JSON only.
         except Exception as e:
             print("⚠️ Gemini fallback failed:", e)
 
+    # --- Fallback ---
     return {"intent": "unknown", "raw": raw}
