@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Voice Controlled Form</title>
+
+    <style>
+      body {
+        background: #f1f3f7;
+        font-family: Arial, sans-serif;
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        padding-top: 40px;
+      }
+
+      .container {
+        width: 450px;
+        background: #ffffff;
+        padding: 25px 30px;
+        border-radius: 12px;
+        box-shadow: 0px 3px 15px rgba(0, 0, 0, 0.12);
+      }
+
+      h2 {
+        text-align: center;
+        margin-bottom: 25px;
+      }
+
+      label {
+        display: block;
+        margin: 10px 0 5px 0;
+        font-size: 15px;
+        font-weight: 600;
+      }
+
+      input,
+      textarea {
+        width: 100%;
+        padding: 12px;
+        border: 1px solid #d1d1d1;
+        border-radius: 6px;
+        font-size: 15px;
+        transition: 0.2s;
+        background: #fafafa;
+      }
+
+      input:focus,
+      textarea:focus {
+        border-color: #6a91f2;
+        background: #ffffff;
+        outline: none;
+        box-shadow: 0 0 4px rgba(106, 145, 242, 0.4);
+      }
+
+      textarea {
+        height: 80px;
+        resize: none;
+      }
+
+      button {
+        width: 100%;
+        padding: 12px;
+        margin-top: 20px;
+        font-size: 16px;
+        background: #3e78ff;
+        border: none;
+        color: white;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: 0.2s;
+        font-weight: bold;
+      }
+
+      button:hover {
+        background: #2c63db;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>Voice Controlled Form</h2>
+
+      <form id="myForm">
+        <label>First Name</label>
+        <input id="first_name" type="text" placeholder="Enter first name" />
+
+        <label>Surname</label>
+        <input id="surname" type="text" placeholder="Enter surname" />
+
+        <label>Address</label>
+        <textarea id="address" placeholder="Enter full address"></textarea>
+
+        <label>Email</label>
+        <input id="email" type="email" placeholder="Enter email" />
+
+        <button type="submit">Submit</button>
+      </form>
+    </div>
+
+    <script>
+      console.log("Connecting to WebSocket…");
+
+      const ws = new WebSocket("ws://localhost:8765");
+
+      ws.onopen = () => {
+        console.log("🟢 WebSocket Connected to Python");
+      };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        console.log("📩 Received from Python:", msg);
+
+        if (msg.type === "fill") {
+          const field = document.getElementById(msg.field);
+          if (field) {
+            field.value = msg.value;
+            console.log("✏️ Field updated:", msg.field, "=", msg.value);
+          } else {
+            console.log("⚠️ Field not found:", msg.field);
+          }
+        }
+
+        if (msg.type === "submit") {
+          console.log("📤 Submitting form...");
+          document.getElementById("myForm").submit();
+        }
+      };
+      
+      function handleFormSubmit(e) {
+        e.preventDefault();
+        showPopup("Form submitted (manual).");
+        // If you want to actually send form contents to a server, do it here.
+        clearFormFields();
+      }
+      function showPopup(text) {
+        const popup = document.createElement("div");
+        popup.className = "popup";
+        popup.innerText = text;
+        document.body.appendChild(popup);
+
+        setTimeout(() => {
+          popup.style.opacity = "0";
+          setTimeout(() => popup.remove(), 500);
+        }, 2000);
+      }
+
+      function clearFormFields() {
+        const ids = ["first_name", "surname", "address", "email"];
+        ids.forEach((id) => {
+          const el = document.getElementById(id);
+          if (el) el.value = "";
+        });
+      }
+    </script>
+  </body>
+</html>

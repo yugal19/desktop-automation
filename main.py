@@ -576,7 +576,17 @@
 
 # if __name__ == "__main__":
 #     run_tray()
+
+
 # main.py
+# main.py (updated)
+# voice_form_dictation_with_overwrite.py
+# Updated assistant script with robust "explicit field correction & replacement" flow
+# (Integrates Flow 2: mentioning a field name resets / overwrites that field)
+# voice_form_dictation_with_overwrite.py
+# Updated assistant script with robust "explicit field correction & replacement" flow
+# (Integrates Flow 2: mentioning a field name resets / overwrites that field)
+
 import os
 import time
 import threading
@@ -585,6 +595,8 @@ import re
 import sys
 import subprocess
 import webbrowser
+import json
+from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -593,18 +605,16 @@ load_dotenv()
 from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
 import pyaudio
 
-# Tray icon
 import pystray
 from PIL import Image, ImageDraw
 
-# interpreter and actions
 from interpreter import parse_command
 import actions
-
-# claude_writer: silence-based dictation & send_immediate
 import claude_writer
 
-# Optional TTS
+import web_socket_server
+import web_form_controller
+
 try:
     import pyttsx3
 
@@ -616,22 +626,31 @@ DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY")
 if not DEEPGRAM_KEY:
     raise ValueError("Set DEEPGRAM_API_KEY in .env")
 
-# audio settings
 RATE = 16000
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 
-# main control flags
 _listening_flag = threading.Event()
 _listening_flag.set()  # start listening by default
 _should_stop = threading.Event()
 
-# dictation state: target can be 'notepad', 'word', 'claude_excel' (excel via Claude)
+
+FORM_OVERWRITE_PENDING = {"active": False, "timer": None}
+
 dictation_state = {"active": False, "target": None}
 
-# short-term fragment buffer: store last unknown transcript to try combining
 _fragment_buf = {"text": None, "time": 0.0}
+
+
+FORM_SUBMISSION_BUFFER: dict = {}
+_form_buffer_lock = threading.Lock()
+SUBMISSIONS_DIR = "submissions"
+os.makedirs(SUBMISSIONS_DIR, exist_ok=True)
+
+CURRENT_FORM_FIELD = {"name": None}
+
+OVERWRITE_PENDING_TIMEOUT = 4.0
 
 
 def speak_feedback(text: str):
@@ -654,14 +673,9 @@ def _create_image(w=64, h=64, color=(40, 140, 240)):
 
 
 def _focus_claude_window():
-    """
-    Focus a Claude Desktop window if available (pygetwindow).
-    Returns True if success.
-    """
     try:
         import pygetwindow as gw
 
-        # search for likely Claude titles
         for title in gw.getAllTitles():
             if not title:
                 continue
@@ -690,7 +704,6 @@ def _focus_claude_window():
 
 
 def activate_claude_excel_mode():
-    """Prepare system for Claude-based Excel dictation."""
     focused = _focus_claude_window()
     if focused:
         print("✅ Focused Claude Desktop for Excel operations.")
@@ -698,15 +711,10 @@ def activate_claude_excel_mode():
         print(
             "⚠️ Could not focus Claude Desktop. Please open and focus Claude manually."
         )
-    # Do not mark dictation active here — start_dictation will do that
     dictation_state["target"] = "claude_excel"
 
 
 def _run_excel_write(text: str):
-    """
-    Called when in dictation mode (claude_excel) to push final transcripts into
-    the silence-based claude_writer buffer.
-    """
     try:
         clean = text.strip()
         if not clean:
@@ -715,48 +723,116 @@ def _run_excel_write(text: str):
             speak_feedback(msg)
             return
         claude_writer.push_text(clean)
-        # don't announce on every push (keeps console quieter)
     except Exception as e:
         res = f"❌ Error pushing Excel text to Claude: {e}"
         print(res)
         speak_feedback(res)
 
 
+def _save_form_buffer_to_json(buffer: dict) -> str:
+    if not buffer:
+        data_to_save = {}
+    else:
+        data_to_save = dict(buffer)
+
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"form_{ts}.json"
+    path = os.path.join(SUBMISSIONS_DIR, filename)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"timestamp": ts, "fields": data_to_save},
+                f,
+                ensure_ascii=False,
+                indent=4,
+            )
+        return path
+    except Exception as e:
+        print("❌ Error saving form JSON:", e)
+        return ""
+
+
+def _clear_overwrite_pending_locked():
+    """Must be called with _form_buffer_lock held."""
+    FORM_OVERWRITE_PENDING["active"] = False
+    timer = FORM_OVERWRITE_PENDING.get("timer")
+    if timer:
+        try:
+            timer.cancel()
+        except Exception:
+            pass
+    FORM_OVERWRITE_PENDING["timer"] = None
+
+
+def _start_overwrite_pending_locked(
+    field_name: str, timeout: float = OVERWRITE_PENDING_TIMEOUT
+):
+    """Set overwrite-pending and start/reset a timer that clears it after `timeout` seconds.
+    Must be called with _form_buffer_lock held."""
+
+    existing = FORM_OVERWRITE_PENDING.get("timer")
+    if existing:
+        try:
+            existing.cancel()
+        except Exception:
+            pass
+
+    FORM_OVERWRITE_PENDING["active"] = True
+
+    def _timeout_clear():
+        with _form_buffer_lock:
+            FORM_OVERWRITE_PENDING["active"] = False
+            FORM_OVERWRITE_PENDING["timer"] = None
+
+    timer = threading.Timer(timeout, _timeout_clear)
+    FORM_OVERWRITE_PENDING["timer"] = timer
+    timer.daemon = True
+    timer.start()
+
+
 def _execute_command_safe(cmd: dict, raw_transcript: str):
-    """
-    Execute parsed command; runs in its own thread to avoid blocking callbacks.
-    """
     if not cmd or not isinstance(cmd, dict):
         print("⚠️ Empty or invalid command; ignoring.")
         return
 
     intent = cmd.get("intent")
     try:
-        # --- Dictation control ---
         if intent == "start_dictation":
             target = cmd.get("target", "notepad")
-            # if interpreter marked excel, treat as Excel→Claude mode
+
+            if target == "form":
+                dictation_state["active"] = True
+                dictation_state["target"] = "form"
+                msg = (
+                    "Form filling mode started. "
+                    "Speak things like 'first name Yugal', 'surname Chandak', or 'submit form'."
+                )
+                print(msg)
+                speak_feedback(msg)
+                return
+
             if target == "excel":
                 activate_claude_excel_mode()
-                # start silence-based claude dictation
                 claude_writer.start_dictation()
                 dictation_state["active"] = True
                 dictation_state["target"] = "claude_excel"
                 msg = "Dictation started for Excel (via Claude)."
                 print(msg)
                 speak_feedback(msg)
-            else:
-                dictation_state["active"] = True
-                dictation_state["target"] = target
-                msg = f"Dictation started for {target}."
-                print(msg)
-                speak_feedback(msg)
+                return
+
+            dictation_state["active"] = True
+            dictation_state["target"] = target
+            msg = f"Dictation started for {target}."
+            print(msg)
+            speak_feedback(msg)
             return
 
         if intent == "stop_dictation":
-            # if claude mode, stop claude writer
             if dictation_state.get("target") == "claude_excel":
                 claude_writer.stop_dictation()
+            with _form_buffer_lock:
+                _clear_overwrite_pending_locked()
             dictation_state["active"] = False
             dictation_state["target"] = None
             msg = "Dictation stopped."
@@ -779,7 +855,68 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
             speak_feedback(msg)
             return
 
-        # --- Save / Close / Close-other apps ---
+        if intent == "fill_form":
+            field = cmd.get("field")
+            value = (cmd.get("value") or "").strip()
+
+            if not field:
+                speak_feedback("⚠️ Could not detect field name.")
+                return
+
+            with _form_buffer_lock:
+                CURRENT_FORM_FIELD["name"] = field
+                _start_overwrite_pending_locked(field)
+
+                if value:
+                    FORM_SUBMISSION_BUFFER[field] = value
+                    _clear_overwrite_pending_locked()
+                else:
+                    FORM_SUBMISSION_BUFFER[field] = ""
+
+                current_value = FORM_SUBMISSION_BUFFER.get(field, "")
+
+            ok = web_form_controller.fill_field(field, current_value)
+            if ok:
+                if value:
+                    speak_feedback(f"Filled {field} with {value}.")
+                else:
+                    speak_feedback(f"{field} selected.")
+            else:
+                speak_feedback("⚠️ Browser not connected. Please open the form first.")
+            return
+
+        if intent == "submit_form":
+            with _form_buffer_lock:
+                buffer_copy = dict(FORM_SUBMISSION_BUFFER)
+
+            saved_path = ""
+            try:
+                saved_path = _save_form_buffer_to_json(buffer_copy)
+                if saved_path:
+                    print(f"📝 Form saved to {saved_path}")
+                else:
+                    print("⚠️ Form not saved (error).")
+            except Exception as e:
+                print("❌ Error while saving form:", e)
+
+            ok = web_form_controller.submit_form()
+            if ok:
+                with _form_buffer_lock:
+                    FORM_SUBMISSION_BUFFER.clear()
+                    CURRENT_FORM_FIELD["name"] = None
+                    _clear_overwrite_pending_locked()
+                if saved_path:
+                    speak_feedback(f"Form submitted and saved to {saved_path}.")
+                else:
+                    speak_feedback("Form submitted (but saving failed).")
+            else:
+                speak_feedback("⚠️ Browser not connected. Cannot submit the form.")
+
+            if dictation_state.get("target") == "form":
+                dictation_state["active"] = False
+                dictation_state["target"] = None
+            return
+
         if intent == "save":
             target = cmd.get("target") or dictation_state.get("target")
             if target == "word":
@@ -827,7 +964,6 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
             speak_feedback(res)
             return
 
-        # ---------- Open explicitly ----------
         if intent == "open":
             app = (cmd.get("app") or raw_transcript or "").strip()
             if not app:
@@ -836,7 +972,13 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
                 speak_feedback(msg)
                 return
 
-            # If user asked to open Excel, switch focus to Claude for MCP-based Excel ops
+            if app.lower() == "form":
+                web_socket_server.start_in_thread()
+                res = actions.open_form()
+                print(res)
+                speak_feedback(res)
+                return
+
             if "excel" in app.lower():
                 focused = actions.focus_claude_window()
                 if focused:
@@ -845,7 +987,6 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
                     res = (
                         "⚠️ Could not focus Claude Desktop. Please open Claude manually."
                     )
-                # set target to claude_excel but do not start dictation automatically
                 dictation_state["target"] = "claude_excel"
             else:
                 res = actions.open_app(app)
@@ -853,7 +994,6 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
             speak_feedback(res)
             return
 
-        # generic `write` intent (notepad/word)
         if intent == "write":
             target = cmd.get("target", "notepad")
             content = cmd.get("content") or raw_transcript or ""
@@ -869,12 +1009,10 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
             speak_feedback(res)
             return
 
-        # explicit excel write command -> forward to Claude (single-shot)
         if intent == "write_excel":
             cell = cmd.get("cell")
             content = cmd.get("content") or raw_transcript or ""
             if not cell:
-                # Try parsing cell name directly from voice
                 match = re.search(r"cell\s*([a-zA-Z]+\d+)", raw_transcript.lower())
                 if match:
                     cell = match.group(1).upper()
@@ -886,19 +1024,16 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
                 return
 
             phrase = f"Write {content} in cell {cell}"
-            # single-shot: type immediately and press Enter
             claude_writer.send_immediate(phrase)
             res = f"✅ Sent to Claude (immediate): {phrase}"
             print(res)
             speak_feedback(res)
             return
 
-        # ---------- Open and write Excel (compound) ----------
         if intent == "open_and_write_excel":
             content = cmd.get("content") or raw_transcript or ""
             cell = cmd.get("cell")
 
-            # Focus Claude
             focused = actions.focus_claude_window()
             if not focused:
                 msg = "⚠️ Could not focus Claude Desktop. Please open Claude manually."
@@ -911,14 +1046,12 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
             else:
                 phrase = f"Open Excel and write {content}"
 
-            # immediate
             claude_writer.send_immediate(phrase)
             res = f"✅ Sent to Claude (immediate): {phrase}"
             print(res)
             speak_feedback(res)
             return
 
-        # web search
         if intent == "search_web":
             engine = cmd.get("engine", "google")
             q = cmd.get("query") or raw_transcript or ""
@@ -944,7 +1077,6 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
                 print("❌ Error opening web search:", e)
             return
 
-        # explorer search
         if intent == "search":
             name = cmd.get("name") or raw_transcript or ""
             res = actions.search_in_explorer(name)
@@ -952,7 +1084,6 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
             speak_feedback(res)
             return
 
-        # stop assistant
         if intent == "stop":
             msg = "🛑 Stopping assistant by voice command."
             print(msg)
@@ -960,7 +1091,6 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
             quit_app()
             return
 
-        # unknown
         if intent == "unknown":
             print("⚠️ Unknown command:", raw_transcript)
             return
@@ -972,10 +1102,6 @@ def _execute_command_safe(cmd: dict, raw_transcript: str):
 
 
 async def _deepgram_runner():
-    """
-    Connect to Deepgram and stream from microphone. The on_transcript callback
-    handles both commands and dictation targets (notepad/word/claude_excel).
-    """
     client = DeepgramClient(DEEPGRAM_KEY)
     dg_conn = client.listen.websocket.v("1")
 
@@ -993,9 +1119,85 @@ async def _deepgram_runner():
         clean_transcript = transcript.strip()
         print("📝 Transcript:", clean_transcript)
 
-        # If dictation is active, handle dictation first (append mode)
         if dictation_state["active"]:
-            # check for dictation-control phrases in the new transcript
+            target = dictation_state.get("target", "notepad")
+
+            if target == "form":
+                cmd = parse_command(clean_transcript)
+
+                if not (
+                    cmd and isinstance(cmd, dict) and cmd.get("intent") == "fill_form"
+                ):
+                    m = re.match(
+                        r"^\s*(first name|firstname|given name|last name|lastname|surname|family name|name|email|phone|mobile|address)\s*[,;:\-]?\s*(.*)$",
+                        clean_transcript,
+                        flags=re.I,
+                    )
+                    if m:
+                        field_raw = m.group(1).lower()
+                        value = (m.group(2) or "").strip()
+
+                        field_map = {
+                            "first name": "first_name",
+                            "firstname": "first_name",
+                            "given name": "first_name",
+                            "last name": "last_name",
+                            "lastname": "last_name",
+                            "surname": "surname",
+                            "family name": "last_name",
+                            "name": "name",
+                            "email": "email",
+                            "phone": "phone",
+                            "mobile": "phone",
+                            "address": "address",
+                        }
+                        field = field_map.get(field_raw, field_raw.replace(" ", "_"))
+
+                        inferred_cmd = {
+                            "intent": "fill_form",
+                            "field": field,
+                            "value": value,
+                        }
+                        print("🔍 Regex fallback detected fill_form:", inferred_cmd)
+                        _execute_command_safe(inferred_cmd, clean_transcript)
+                        return
+
+                if cmd and cmd.get("intent") == "fill_form":
+                    _execute_command_safe(cmd, clean_transcript)
+                    return
+
+                if cmd and cmd.get("intent") in ("submit_form", "stop_dictation"):
+                    threading.Thread(
+                        target=_execute_command_safe,
+                        args=(cmd, clean_transcript),
+                        daemon=True,
+                    ).start()
+                    return
+
+                with _form_buffer_lock:
+                    active_field = CURRENT_FORM_FIELD.get("name")
+                    overwrite_pending = FORM_OVERWRITE_PENDING.get("active", False)
+
+                if active_field:
+                    value = clean_transcript.strip()
+
+                    with _form_buffer_lock:
+                        if overwrite_pending:
+                            FORM_SUBMISSION_BUFFER[active_field] = value
+                            _clear_overwrite_pending_locked()
+                        else:
+                            prev = FORM_SUBMISSION_BUFFER.get(active_field, "")
+                            FORM_SUBMISSION_BUFFER[active_field] = (
+                                prev + " " + value if prev else value
+                            )
+                        final_value = FORM_SUBMISSION_BUFFER[active_field]
+
+                    web_form_controller.fill_field(active_field, final_value)
+                    speak_feedback(f"{active_field} updated.")
+                else:
+                    speak_feedback("⚠️ Please say the field name first.")
+                return
+
             ctrl = parse_command(clean_transcript)
             if ctrl and ctrl.get("intent") == "stop_dictation":
                 threading.Thread(
@@ -1005,8 +1207,6 @@ async def _deepgram_runner():
                 ).start()
                 return
 
-            # else append content directly to target
-            target = dictation_state.get("target", "notepad")
             if target == "word":
                 threading.Thread(
                     target=_execute_command_safe,
@@ -1021,11 +1221,8 @@ async def _deepgram_runner():
                     daemon=True,
                 ).start()
             elif target == "claude_excel":
-                # For Claude Excel dictation, push text to claude_writer's buffer
                 threading.Thread(
-                    target=_run_excel_write,  # calls claude_writer.push_text()
-                    args=(clean_transcript,),
-                    daemon=True,
+                    target=_run_excel_write, args=(clean_transcript,), daemon=True
                 ).start()
             else:
                 threading.Thread(
@@ -1042,7 +1239,6 @@ async def _deepgram_runner():
                 ).start()
             return
 
-        # Not dictation: try parse
         cmd = parse_command(clean_transcript)
         if not cmd or not isinstance(cmd, dict):
             print("No valid Command (parse_command returned None or invalid).")
@@ -1056,7 +1252,6 @@ async def _deepgram_runner():
             _fragment_buf["time"] = 0.0
             return
 
-        # If unknown: attempt to combine with previous unknown fragment if recent
         now = time.time()
         prev_text = _fragment_buf.get("text")
         prev_time = _fragment_buf.get("time", 0)
@@ -1073,7 +1268,6 @@ async def _deepgram_runner():
                 _fragment_buf["time"] = 0.0
                 return
 
-        # otherwise buffer this transcript as possible fragment
         _fragment_buf["text"] = clean_transcript
         _fragment_buf["time"] = now
         print("⚠️ Unknown command (buffered):", clean_transcript)
@@ -1117,7 +1311,6 @@ async def _deepgram_runner():
             time.sleep(0.1)
             continue
 
-    # end cleanup
     try:
         dg_conn.finish()
     except Exception:
@@ -1131,14 +1324,12 @@ async def _deepgram_runner():
     print("🛑 Deepgram loop terminated.")
 
 
-# Thread runner helper
 def _run_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_deepgram_runner())
     loop.close()
 
 
-# Tray integration & control
 _loop_thread = None
 _async_loop = None
 _tray_icon = None
@@ -1187,6 +1378,8 @@ def quit_app(icon=None, item=None):
 
 def run_tray():
     global _tray_icon
+    web_socket_server.start_in_thread()
+
     image = _create_image()
     menu = pystray.Menu(
         pystray.MenuItem(

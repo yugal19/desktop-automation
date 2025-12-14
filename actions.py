@@ -659,7 +659,8 @@
 #     row = 1 if _excel_sheet.Cells(1, 1).Value in (None, "") and last == 1 else last + 1
 #     _excel_sheet.Cells(row, 1).Value = text
 #     return f"✅ Wrote '{text}' into A{row}."
-# actions.py
+
+
 import os
 import subprocess
 import time
@@ -667,6 +668,7 @@ from typing import Optional
 import psutil
 import pyautogui
 import webbrowser
+from pathlib import Path
 
 try:
     import pygetwindow as gw
@@ -677,6 +679,22 @@ try:
     import win32com.client as win32
 except Exception:
     win32 = None
+
+# Websocket server integration for form control (no Selenium)
+# web_socket_server provides start_in_thread() and manages connected browser client.
+# web_form_controller contains fill_field() and submit_form() helpers.
+try:
+    import web_socket_server
+    import web_form_controller
+except Exception:
+    web_socket_server = None
+    web_form_controller = None
+
+# ---------- CONFIG: set your form.html absolute path here ----------
+# Example: r"C:\Users\yugal\projects\voice_form\form.html"
+_FORM_HTML = r"E:\Projects\Desktop-automation\desktop-main\form.html"  # <<-- CHANGE THIS to the real path on your system
+
+
 
 
 # ---------- Notepad helpers ----------
@@ -821,6 +839,107 @@ def close_word() -> str:
         return f"❌ Error closing Word: {e}"
 
 
+# ---------- WebSocket-form helpers (new additions) ----------
+def _ensure_ws_server_started() -> None:
+    """
+    Start the local WebSocket server thread if available.
+    Safe to call multiple times.
+    """
+    if web_socket_server is None:
+        # If module not available, we can't start it — just return
+        return
+    try:
+        web_socket_server.start_in_thread()
+    except Exception:
+        # ignore errors starting server (main.py also attempts to start)
+        pass
+
+
+def open_form() -> str:
+    """
+    Open the local HTML form in the default browser and ensure WebSocket server is running.
+    Returns a status string similar to other actions helpers.
+    """
+    _ensure_ws_server_started()
+
+    form_path = Path(_FORM_HTML)
+    if not form_path.exists():
+        return f"❌ form.html not found at {_FORM_HTML}"
+
+    try:
+        # On Windows, os.startfile opens in default browser. Use webbrowser fallback.
+        try:
+            os.startfile(str(form_path))
+        except Exception:
+            webbrowser.open(f"file://{str(form_path)}")
+        time.sleep(0.6)  # give the browser a moment to start and connect
+        return f"✅ Opened form at {str(form_path)}"
+    except Exception as e:
+        return f"❌ Could not open form: {e}"
+
+
+def close_form() -> str:
+    """
+    Best-effort: try to find an open browser window containing the form title and close it.
+    Non-destructive: if it fails, returns a descriptive error string.
+    """
+    title_substr = "Voice Controlled Form"  # matches <title> in form.html
+    try:
+        if gw:
+            wins = gw.getWindowsWithTitle(title_substr)
+            if wins:
+                for w in wins:
+                    try:
+                        w.close()
+                    except Exception:
+                        try:
+                            w.minimize()
+                            w.close()
+                        except Exception:
+                            pass
+                return "✅ Closed form window(s)."
+            else:
+                return "⚠️ No form window found to close."
+        else:
+            # As fallback, attempt to close common browsers (NOT recommended unless user requests)
+            return "⚠️ pygetwindow not available; cannot close form window programmatically."
+    except Exception as e:
+        return f"❌ Error closing form: {e}"
+
+
+def send_form_field(field_id: str, value: str) -> str:
+    """
+    Convenience wrapper to send a fill command via web_form_controller if available.
+    Returns status string.
+    """
+    if web_form_controller is None:
+        return "❌ web_form_controller not available."
+    try:
+        ok = web_form_controller.fill_field(field_id, value)
+        if ok:
+            return f"✅ Sent {field_id} = {value} to browser."
+        else:
+            return "⚠️ Browser is not connected to WebSocket."
+    except Exception as e:
+        return f"❌ Error sending field: {e}"
+
+
+def submit_form() -> str:
+    """
+    Convenience wrapper to send a submit command via web_form_controller if available.
+    """
+    if web_form_controller is None:
+        return "❌ web_form_controller not available."
+    try:
+        ok = web_form_controller.submit_form()
+        if ok:
+            return "✅ Submitted form (sent submit command)."
+        else:
+            return "⚠️ Browser is not connected to WebSocket."
+    except Exception as e:
+        return f"❌ Error sending submit command: {e}"
+
+
 # ---------- Open generic app ----------
 def open_app(name: str) -> str:
     if not name:
@@ -882,7 +1001,7 @@ def open_app(name: str) -> str:
             subprocess.Popen("start code", shell=True)
             return "✅ Opening VSCode."
 
-        # NOTE: we do NOT special-case "excel" here anymore (Excel handled via Claude+MCP)
+        # NOTE: we DO NOT special-case "excel" here anymore (Excel handled via Claude+MCP)
         # Fallback: try to open by name
         subprocess.Popen(f"start {name}", shell=True)
         return f"✅ Attempting to open {name}"
