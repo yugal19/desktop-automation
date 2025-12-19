@@ -632,7 +632,7 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 
 _listening_flag = threading.Event()
-_listening_flag.set()  # start listening by default
+_listening_flag.set()
 _should_stop = threading.Event()
 
 
