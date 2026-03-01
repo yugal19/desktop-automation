@@ -1,4 +1,3 @@
-# interpreter.py (patched)
 import os
 import json
 import re
@@ -35,13 +34,9 @@ KNOWN_APPS = [
     "form",
 ]
 
-# Keeps track of the last field the user was filling in the form mode.
 LAST_FORM_FIELD: Optional[str] = None
 
-# Stores the current accumulated values per field while filling via voice
-FORM_FIELD_VALUES: dict = (
-    {}
-)  # e.g. {"first_name":"John Doe", "address":"Flat 101, ..."}
+FORM_FIELD_VALUES: dict = {}
 
 
 def _clean(text: str) -> str:
@@ -94,7 +89,6 @@ def parse_command(text: str) -> dict:
     raw = text or ""
     t = _clean(raw)
 
-    # STOP / QUIT
     if any(
         kw in t
         for kw in [
@@ -106,7 +100,6 @@ def parse_command(text: str) -> dict:
     ):
         return {"intent": "stop"}
 
-    # OPEN FORM
     if re.search(r"\bopen\b.*\bform\b", t) or t in (
         "open form",
         "open the form",
@@ -115,7 +108,6 @@ def parse_command(text: str) -> dict:
         CURRENT_APP = "form"
         return {"intent": "open", "app": "form"}
 
-    # START/CONTINUE DICTATION
     if any(
         kw in t
         for kw in [
@@ -140,7 +132,6 @@ def parse_command(text: str) -> dict:
             target = "form"
         return {"intent": "start_dictation", "target": target}
 
-    # FORM MODE: raw email with @ (preserve)
     email_match_raw = re.search(r"\bemail\s+([A-Za-z0-9._%+\-@]+)\b", raw, flags=re.I)
     if email_match_raw:
         email_val = email_match_raw.group(1).strip()
@@ -149,7 +140,6 @@ def parse_command(text: str) -> dict:
             FORM_FIELD_VALUES["email"] = email_val
             return {"intent": "fill_form", "field": "email", "value": email_val}
 
-    # FORM MODE: spoken email patterns
     m = re.match(r"^(?:email|enter email|fill email|my email is)\s+(.+)$", t)
     if m:
         spoken = m.group(1).strip()
@@ -175,8 +165,6 @@ def parse_command(text: str) -> dict:
             "value": FORM_FIELD_VALUES["email"],
         }
 
-    # FORM FIELD FILLING: first_name, surname, address
-    # NOTE: When the user explicitly says the field name, we OVERWRITE that field value.
     field_patterns = [
         (r"^(?:first name|firstname|first)\s+(.+)$", "first_name"),
         (r"^(?:surname|last name|lastname|last|family name)\s+(.+)$", "surname"),
@@ -187,12 +175,10 @@ def parse_command(text: str) -> dict:
         mm = re.match(patt, t)
         if mm:
             val = mm.group(1).strip()
-            # OVERWRITE behaviour: replace previous value entirely
             LAST_FORM_FIELD = fid
             FORM_FIELD_VALUES[fid] = val
             return {"intent": "fill_form", "field": fid, "value": val}
 
-    # "<value> in <field>" and "fill <value> in <field>"
     m = re.match(r"^(.+)\s+in\s+(first name|surname|address|email)$", t)
     if m:
         val = m.group(1).strip()
@@ -204,7 +190,6 @@ def parse_command(text: str) -> dict:
             "email": "email",
         }
         fid = field_map[fld_spoken]
-        # OVERWRITE when field name is explicitly mentioned
         if fid == "email":
             val_norm = _spoken_to_email(val)
             LAST_FORM_FIELD = "email"
@@ -226,7 +211,6 @@ def parse_command(text: str) -> dict:
             "email": "email",
         }
         fid = field_map[fld_spoken]
-        # OVERWRITE when field name present
         if fid == "email":
             val_norm = _spoken_to_email(val)
             LAST_FORM_FIELD = "email"
@@ -236,19 +220,15 @@ def parse_command(text: str) -> dict:
             LAST_FORM_FIELD = fid
             FORM_FIELD_VALUES[fid] = val
             return {"intent": "fill_form", "field": fid, "value": val}
-
-    # FORM SUBMIT: clear stored form state here so next session is fresh
     if re.search(r"\b(submit|send)\b.*\bform\b", t) or t in (
         "submit form",
         "submit the form",
         "finish form",
     ):
-        # Clear stored form buffer & last-field pointer
         LAST_FORM_FIELD = None
         FORM_FIELD_VALUES.clear()
         return {"intent": "submit_form"}
 
-    # STOP DICTATION
     if any(
         kw in t
         for kw in [
@@ -261,12 +241,9 @@ def parse_command(text: str) -> dict:
         ]
     ):
         return {"intent": "stop_dictation"}
-
-    # NEXT LINE
     if any(kw in t for kw in ["next line", "new line", "line break"]):
         return {"intent": "next_line"}
 
-    # SAVE
     if (
         "save this file" in t
         or t.startswith("save ")
@@ -281,8 +258,6 @@ def parse_command(text: str) -> dict:
         else:
             target = CURRENT_APP
         return {"intent": "save", "target": target}
-
-    # CLOSE
     if (
         t.startswith("close ")
         or t.startswith("stop ")
@@ -303,7 +278,6 @@ def parse_command(text: str) -> dict:
             target = CURRENT_APP
         return {"intent": "close", "target": target}
 
-    # OPEN & WRITE (generic)
     m = re.match(r"open\s+([a-z0-9 ]+)\s+and\s+write\s+(.+)", t)
     if m:
         app = m.group(1).strip()
@@ -311,7 +285,6 @@ def parse_command(text: str) -> dict:
         CURRENT_APP = app
         return {"intent": "open_and_write", "app": app, "content": content}
 
-    # GENERIC WRITE
     if t.startswith("write ") or t.startswith("type "):
         content = (
             t.replace("write ", "", 1)
@@ -327,7 +300,6 @@ def parse_command(text: str) -> dict:
             target = "notepad"
         return {"intent": "write", "target": target, "content": content}
 
-    # EXCEL cases (kept)
     m = re.match(r"open\s+excel\s+and\s+write\s+(.+)", t)
     if m:
         content_part = m.group(1).strip()
@@ -365,7 +337,6 @@ def parse_command(text: str) -> dict:
             "cell": cell,
         }
 
-    # WEB SEARCH
     if "search " in t or "google" in t or "wikipedia" in t or "youtube" in t:
         browser = None
         if "in brave" in t or "using brave" in t:
@@ -410,7 +381,6 @@ def parse_command(text: str) -> dict:
                 "browser": browser,
             }
 
-    # EXPLORER / FILE SEARCH
     if "file explorer" in t or "windows explorer" in t or t.strip() in ["explorer"]:
         m = re.match(r"(?:open|show)\s+(.+)\s+in\s+(?:file|windows)?\s*explorer", t)
         if m:
@@ -430,7 +400,6 @@ def parse_command(text: str) -> dict:
         )
         return {"intent": "search", "name": name}
 
-    # KNOWN APPS FALLBACK
     for app in KNOWN_APPS:
         if re.search(r"(?:open|start)\s+" + re.escape(app) + r"\b", t) or re.search(
             r"\b" + re.escape(app) + r"\b", t
@@ -440,8 +409,6 @@ def parse_command(text: str) -> dict:
             CURRENT_APP = app
             return {"intent": "open", "app": app}
 
-    # FORM CONTINUATION: if in form mode and last field set, treat raw as continuation
-    # This is the only place where we append to an existing field.
     if CURRENT_APP == "form" and LAST_FORM_FIELD:
         incoming = raw.strip()
         if incoming:
@@ -449,7 +416,6 @@ def parse_command(text: str) -> dict:
                 new_piece = _spoken_to_email(incoming)
                 prev = FORM_FIELD_VALUES.get("email", "")
                 if prev:
-                    # if incoming contains '@' assume correction/replacement
                     merged = (
                         new_piece if "@" in new_piece else (prev + new_piece).strip()
                     )
@@ -468,7 +434,6 @@ def parse_command(text: str) -> dict:
                     "value": new_val,
                 }
 
-    # Optional Gemini fallback omitted for brevity here (same as earlier if enabled)
     if ENABLE_GEMINI and genai_client:
         try:
             prompt = f"""
@@ -487,5 +452,4 @@ Output JSON only.
         except Exception as e:
             print("⚠️ Gemini fallback failed:", e)
 
-    # FALLBACK: unknown
     return {"intent": "unknown", "raw": raw}

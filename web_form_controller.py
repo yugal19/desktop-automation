@@ -1,5 +1,3 @@
-# web_form_controller.py
-import json
 import web_socket_server
 
 

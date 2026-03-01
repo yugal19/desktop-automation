@@ -19,18 +19,16 @@ from pynput.keyboard import Controller, Key
 
 keyboard = Controller()
 
-# config via env (defaults to 4.0 seconds)
 try:
     SILENCE_SECONDS = float(os.getenv("CLAUDE_SILENCE_SECONDS", "4.0"))
 except Exception:
     SILENCE_SECONDS = 4.0
 
-CHECK_INTERVAL = 0.15  # how often watcher checks for silence (seconds)
+CHECK_INTERVAL = 0.15
 
-# internal state
-_buffer = ""  # accumulated text
-_last_speech_time = 0.0  # timestamp of last push_text call
-_active = False  # dictation mode on/off
+_buffer = ""
+_last_speech_time = 0.0
+_active = False  
 _thread: Optional[threading.Thread] = None
 _lock = threading.Lock()
 
@@ -43,7 +41,6 @@ def _type_into_claude(msg: str):
 
     print(f"🟢 Typing into Claude (len {len(msg)}): {msg}")
 
-    # type slowly but reliably
     for ch in msg:
         keyboard.press(ch)
         keyboard.release(ch)
@@ -58,7 +55,6 @@ def send_immediate(message: str):
     if not message or not message.strip():
         return
     with _lock:
-        # don't interfere with active dictation buffer; send separately
         _type_into_claude(message.strip())
 
 
@@ -70,7 +66,6 @@ def push_text(text: str):
     global _buffer, _last_speech_time
 
     if not _active:
-        # ignore pushes when dictation not active
         return
 
     if not text:
@@ -104,8 +99,8 @@ def _watcher():
             silence = time.time() - _last_speech_time
             if silence >= SILENCE_SECONDS:
                 to_send = _buffer.strip()
-                _buffer = ""  # clear before sending to avoid races
-                print("🤫 Silence detected → sending accumulated text to Claude")
+                _buffer = ""
+                print("Silence detected → sending accumulated text to Claude")
                 try:
                     _type_into_claude(to_send)
                 except Exception as e:
@@ -134,7 +129,6 @@ def stop_dictation():
         return "Not running"
     _active = False
 
-    # flush leftover buffer if any
     with _lock:
         leftover = _buffer.strip()
         _buffer = ""
@@ -145,6 +139,5 @@ def stop_dictation():
         except Exception as e:
             print("❌ Error while flushing leftover buffer:", e)
 
-    # wait briefly for watcher to exit (non-blocking)
     print("⛔ Claude dictation STOPPED.")
     return "Stopped claude dictation"
